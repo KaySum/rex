@@ -27,10 +27,17 @@ local function find(block_id)
   end
 end
 
-local function agent_in(window_id)
+-- The tab's agent, preferring one opened from (or attached to) the given pane.
+local function agent_in(window_id, from)
+  local first
   for _, e in ipairs(blocks()) do
-    if e.agent and e.window.window_id == window_id then return e.block.block_id end
+    if e.agent and e.window.window_id == window_id then
+      local id = e.block.block_id
+      if origins[id] and origins[id].block == from then return id end
+      first = first or id
+    end
   end
+  return first
 end
 
 -- The pane the agent was opened from, or another pane in its tab if that one is gone.
@@ -145,14 +152,16 @@ rex.action{
   title = "Toggle Agent Split",
   run   = function(ctx)
     local here = find(ctx.block_id)
-    local agent = here and agent_in(here.window.window_id)
-    if not agent then return { agent = false } end
-    if ctx.block_id == agent then
-      local target = origin_of(agent)
-      if target then must(rex.session.zoom_block{ block_id = target, zoom = true }) end
-    else
-      must(rex.session.focus_block{ block_id = agent })
+    if not here then return { agent = false } end
+    if here.agent then -- any agent, not just the tab's first one
+      local target = origin_of(ctx.block_id)
+      if not target then return { agent = false } end -- nothing left in the tab to go back to
+      must(rex.session.zoom_block{ block_id = target, zoom = true })
+      return { agent = true }
     end
+    local agent = agent_in(here.window.window_id, ctx.block_id)
+    if not agent then return { agent = false } end
+    must(rex.session.focus_block{ block_id = agent })
     return { agent = true }
   end,
 }
@@ -163,7 +172,7 @@ rex.action{
   title = "Close Agent Split",
   run   = function(ctx)
     local here = find(ctx.block_id)
-    local agent = here and agent_in(here.window.window_id)
+    local agent = here and agent_in(here.window.window_id, ctx.block_id)
     if not agent then return { agent = false } end
     blur(agent)
     must(rex.call("block.close", { session_id = ctx.session_id, block_id = agent }))
@@ -184,22 +193,30 @@ local function nvim_picker(source)
   end
 end
 
--- nvim panes that turned the override off (:SidekickRex off). Rex leaves keys alone in them and in
--- the agents they own, as if none of this existed.
+-- nvim panes that turned the override off (:SidekickRex off), with that nvim's pid. Rex leaves keys
+-- alone in them and in the agents they own, until that nvim turns it back on or exits.
 local paused = {}
+
+local function foreground_pid(block_id)
+  local proc = rex.block.call(TERMINAL, "process", { block_id = block_id })
+  return proc and proc.foreground and proc.foreground.pid
+end
 
 rex.action{
   name  = "agent_override",
   title = "Set Agent Override",
   args  = { enabled = "boolean" },
   run   = function(ctx, args)
-    paused[ctx.block_id] = not args.enabled or nil
+    paused[ctx.block_id] = not args.enabled and foreground_pid(ctx.block_id) or nil
   end,
 }
 
 local function is_paused(block_id)
-  local o = origins[block_id]
-  return paused[block_id] or (o ~= nil and paused[o.block]) or false
+  local pane = paused[block_id] and block_id or (origins[block_id] and origins[block_id].block)
+  local pid = pane and paused[pane]
+  if pid and foreground_pid(pane) == pid then return true end
+  if pane then paused[pane] = nil end
+  return false
 end
 
 -- Keys that only apply while an agent pane has focus, like sidekick's terminal keymaps.
