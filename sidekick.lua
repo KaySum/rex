@@ -2,39 +2,11 @@
 -- nvim's sidekick drives these through ~/.config/nvim/lua/sidekick_rex.lua.
 
 local TERMINAL = "com.superlogical.terminal"
-local STATE = os.getenv("HOME") .. "/.local/share/rex/sidekick.json"
+local origins = {} -- agent block -> { block = pane it was opened from, nvim = { progpath, servername } }
 
 local function must(res, err)
   if err ~= nil then error(err, 0) end
   return res
-end
-
--- Kept in a file so ownership survives config reloads.
-local function load()
-  local f = io.open(STATE)
-  if not f then return {} end
-  local data = f:read("*a")
-  f:close()
-  return rex.json.decode(data) or {}
-end
-
-local origins = load() -- agent block -> { block = pane it was opened from, nvim = { progpath, servername } }
-
--- Writes origins, dropping agents that no longer exist. Can't run at load: no client is in scope then.
-local function persist()
-  local live = {}
-  for _, s in ipairs(must(rex.call("session.attach_all", { event_scope = "session" })).sessions) do
-    for _, b in ipairs(must(rex.call("session.list_blocks", { session_id = s.session_id })).blocks) do
-      live[b.block_id] = true
-    end
-  end
-  for agent in pairs(origins) do
-    if not live[agent] then origins[agent] = nil end
-  end
-  rex.exec({ "mkdir", "-p", STATE:match("^(.*)/") })
-  local f = assert(io.open(STATE, "w"))
-  f:write(rex.json.encode(origins))
-  f:close()
 end
 
 local function blocks()
@@ -110,7 +82,6 @@ rex.action{
     })
     local agent = res.block_ids[1]
     origins[agent] = { block = ctx.block_id, nvim = args.nvim }
-    persist()
     return { block_id = agent }
   end,
 }
@@ -136,7 +107,6 @@ rex.action{
     end
     must(rex.session.focus_block{ block_id = args.block_id })
     origins[args.block_id] = { block = ctx.block_id, nvim = args.nvim }
-    persist()
   end,
 }
 
@@ -207,49 +177,14 @@ rex.action{
     blur(agent)
     must(rex.call("block.close", { session_id = ctx.session_id, block_id = agent }))
     origins[agent] = nil
-    persist()
     return { agent = true, block_id = agent }
   end,
 }
-
--- For resurrect.lua: which pane owns each agent, and setting it again after a restore.
-rex.action{
-  name  = "agent_origins",
-  title = "List Agent Origins",
-  run   = function()
-    local ret = {}
-    for agent, o in pairs(origins) do ret[agent] = o.block end
-    return { origins = ret }
-  end,
-}
-
-rex.action{
-  name  = "agent_adopt",
-  title = "Adopt Agent Split",
-  args  = { block_id = "string", origin = "string" },
-  run   = function(_, args)
-    origins[args.block_id] = { block = args.origin }
-    persist()
-  end,
-}
-
--- An nvim's { progpath, servername }, for adopted agents whose nvim never told us.
--- The server is a child of nvim's TUI process, and its socket is named after the child's pid.
-local function nvim_addr(block_id)
-  local proc = rex.block.call(TERMINAL, "process", { block_id = block_id })
-  local fg = proc and proc.foreground
-  if not (fg and fg.name == "nvim") then return nil end
-  local res = rex.exec({ "sh", "-c",
-    'for p in $(pgrep -P "$0") "$0"; do ls "$TMPDIR"nvim."$USER"/*/nvim.$p.0; done 2>/dev/null', tostring(fg.pid) })
-  local sock = res.stdout:match("[^\n]+")
-  return sock and { fg.path, sock }
-end
 
 -- Opens a sidekick picker in the agent's nvim; the picked items are sent back to the agent.
 local function nvim_picker(source)
   return function(ctx)
     local origin = origins[ctx.block_id]
-    if origin and not origin.nvim then origin.nvim = nvim_addr(origin.block) end
     if not (origin and origin.nvim) then return false end
     blur(ctx.block_id)
     local lua = ("require('sidekick.cli.picker').open(%q, { filter = { session = %q } })"):format(source, "rex: " .. ctx.block_id)
